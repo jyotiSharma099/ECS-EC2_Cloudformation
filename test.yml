@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "The template used to create an ECS Cluster from the ECS Console."
+Parameters:
+  ECSClusterName:
+    Type: String
+    Description: "Specifies the ECS Cluster Name with which the resources would be associated"
+    Default: "AI-Dev-Cluster"
+  DockerImageUri:
+    Type: String
+    Description: URI of the Docker image to deploy
+    Default: "httpd"
+Resources:
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: vpc-0029f60dd922eb887
+      GroupDescription: Security Group for ECS Service
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ECSLaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    DependsOn: 
+      - ECSCluster
+      - ECSServiceSecurityGroup
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0a946522147cbcbcc
+        InstanceType: "t3.medium"
+        KeyName: AI-ECS-Dev
+        IamInstanceProfile:
+          Arn: arn:aws:iam::581837793822:instance-profile/ecsInstanceRole
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: "true"
+            DeviceIndex: "0"
+            SubnetId: "subnet-00ed19bf19f9b8463"
+            Groups:
+              - !Ref ECSServiceSecurityGroup
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            ECSClusterName="AI-Dev-Cluster"
+            sudo yum update -y
+            sudo yum install docker -y
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            # Create directories and files for ecs configuration
+            sudo mkdir -p /etc/ecs
+            sudo touch /etc/ecs/ecs.config
+            # Add the following lines to /etc/ecs/ecs.config
+            cat <<EOT >> /etc/ecs/ecs.config
+            ECS_DATADIR=/data
+            ECS_ENABLE_TASK_IAM_ROLE=true
+            ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true
+            ECS_LOGFILE=/log/ecs-agent.log
+            ECS_AVAILABLE_LOGGING_DRIVERS=["json-file","awslogs"]
+            ECS_LOGLEVEL=info
+            ECS_CLUSTER=${ECSClusterName}
+            EOT
+            # Pull the latest amazon-ecs-agent image
+            sudo docker pull public.ecr.aws/ecs/amazon-ecs-agent:latest
+            # Create directories for ecs logs and data
+            sudo mkdir -p /var/log/ecs /var/lib/ecs/data
+            # Run the ecs-agent container with the specified configuration
+            sudo docker run --name ecs-agent \
+              --detach=true \
+              --restart=on-failure:10 \
+              --volume=/var/run:/var/run \
+              --volume=/var/log/ecs/:/log \
+              --volume=/var/lib/ecs/data:/data \
+              --volume=/etc/ecs:/etc/ecs \
+              --volume=/etc/ecs:/etc/ecs/pki \
+              --net=host \
+              --env-file=/etc/ecs/ecs.config \
+              amazon/amazon-ecs-agent:latest
+                
+  ECSAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    DependsOn: "ECSCluster"
+    Properties:
+      MinSize: "1"
+      MaxSize: 2
+      DesiredCapacity: "1"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt [ECSLaunchTemplate, LatestVersionNumber]
+      VPCZoneIdentifier:
+         - subnet-00ed19bf19f9b8463 
+         - subnet-001a1fa5b7ecf27be
+      Tags:
+        - Key: "Name"
+          PropagateAtLaunch: true
+          Value: !Join [" - ", ["ECS Instance", !Ref ECSClusterName]]
+  ECSCluster:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Ref ECSClusterName
+      ClusterSettings:
+        - Name: "containerInsights"
+          Value: "disabled"
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: "DEFAULT"
+      ServiceConnectDefaults:
+        Namespace: "AI-Dev-Cluster"
+      Tags: []
+  EC2CapacityProvider:
+    Type: "AWS::ECS::CapacityProvider"
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ECSAutoScalingGroup
+        ManagedScaling:
+          Status: "ENABLED"
+          TargetCapacity: 100
+        ManagedTerminationProtection: "DISABLED"
+  ClusterCPAssociation:
+    Type: "AWS::ECS::ClusterCapacityProviderAssociations"
+    DependsOn: "ECSCluster"
+    Properties:
+      Cluster:
+        Ref: "ECSClusterName"
+      CapacityProviders:
+        - Ref: "EC2CapacityProvider"
+      DefaultCapacityProviderStrategy:
+        - Base: 0
+          Weight: 1
+          CapacityProvider:
+            Ref: "EC2CapacityProvider"
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly  # Added ECR ReadOnly policy
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess  # For accessing EC2 instances
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ai-dev
+      Cpu: "256"
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      Memory: "512"
+      NetworkMode: bridge
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Name: ai-dev
+          Image: !Ref DockerImageUri
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: "ai-dev"
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/ai-dev"
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: TaskDefinition
+    Properties:
+      Cluster: !Ref "ECSClusterName"
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+  
+Outputs:
+  ECSCluster:
+    Description: "The created cluster."
+    Value:
+      Ref: "ECSCluster"
